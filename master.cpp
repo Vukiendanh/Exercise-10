@@ -9,39 +9,85 @@
 #include <cstring>
 #include "../common/protocol.h"
 
-// Định nghĩa các cấu trúc dữ liệu lưu trữ nội bộ của Master theo yêu cầu đề bài
-std::vector<WorkerInfo> worker_table; // Bảng quản lý Worker [cite: 60, 173]
-std::vector<Task> task_queue;         // Hàng đợi quản lý Tác vụ [cite: 40, 173]
+// Bảng quản lý nội bộ của Master
+std::vector<WorkerInfo> worker_table; 
+std::vector<Task> task_queue;         
 
-// Khóa Mutex để đồng bộ hóa dữ liệu giữa các luồng, tránh xung đột (Race Condition) [cite: 204, 205, 206]
+// Mutex đồng bộ hóa tránh xung đột luồng
 std::mutex worker_mutex;
 std::mutex task_mutex;
 
+// Cấu hình thuật toán lập lịch: 0 = FIFO, 1 = Round Robin, 2 = Least Loaded
+int scheduling_policy = 0; 
+int rr_index = 0; 
+
+// Biến phục vụ luồng tự động bấm giờ thí nghiệm
+std::chrono::steady_clock::time_point start_time;
+bool is_experiment_started = false;
+int total_tasks_inserted = 0;
+
 // ============================================================================
-// THREAD 3: LUỒNG GIÁM SÁT HEARTBEAT & PHỤC HỒI LỖI (FAULT TOLERANCE)
+// HÀM CHỌN WORKER LINH HOẠT THEO THUẬT TOÁN ĐÃ CHỌN
+// ============================================================================
+int select_worker() {
+    if (worker_table.empty()) return -1;
+
+    // --- 1. THUẬT TOÁN FIFO (Chọn worker rảnh đầu tiên) ---
+    if (scheduling_policy == 0) {
+        for (auto& worker : worker_table) {
+            if (worker.alive && worker.current_load == 0) {
+                return worker.worker_id;
+            }
+        }
+    }
+    // --- 2. THUẬT TOÁN ROUND ROBIN (Luân phiên xoay vòng) ---
+    else if (scheduling_policy == 1) {
+        int total_workers = worker_table.size();
+        for (int i = 0; i < total_workers; i++) {
+            int idx = (rr_index + i) % total_workers;
+            if (worker_table[idx].alive) {
+                rr_index = (idx + 1) % total_workers;
+                return worker_table[idx].worker_id;
+            }
+        }
+    }
+    // --- 3. THUẬT TOÁN LEAST LOADED (Giao cho thằng ít việc nhất) ---
+    else if (scheduling_policy == 2) {
+        int min_load = 999999;
+        int target_id = -1;
+        for (auto& worker : worker_table) {
+            if (worker.alive && worker.current_load < min_load) {
+                min_load = worker.current_load;
+                target_id = worker.worker_id;
+            }
+        }
+        return target_id;
+    }
+    return -1;
+}
+
+// ============================================================================
+// THREAD 3: GIÁM SÁT TIMEOUT HEARTBEAT (FAULT TOLERANCE)
 // ============================================================================
 void heartbeat_monitor() {
     while (true) {
-        std::this_thread::sleep_for(std::chrono::seconds(1)); // Quét mỗi 1 giây [cite: 198]
+        std::this_thread::sleep_for(std::chrono::seconds(1)); 
         
         std::lock_guard<std::mutex> w_lock(worker_mutex);
         std::lock_guard<std::mutex> t_lock(task_mutex);
         
         time_t now = time(nullptr);
         for (auto& worker : worker_table) {
-            // Phát hiện lỗi nếu Quá 6 giây không nhận được Heartbeat từ Worker đang sống [cite: 43, 157, 158, 159]
             if (worker.alive && (now - worker.last_heartbeat > 6)) { 
-                worker.alive = false; // Đánh dấu Worker = FAILED [cite: 161]
-                std::cout << "\n[ALERT] Worker " << worker.worker_id << " da bi TIMEOUT (Qua 6s khoang co Heartbeat)!\n";
+                worker.alive = false; 
+                std::cout << "\n[ALERT] Worker " << worker.worker_id << " bi TIMEOUT (Qua 6s khong co Heartbeat)!\n";
                 
-                // CƠ CHẾ PHỤC HỒI LỖI (FAILURE RECOVERY) [cite: 44, 162]
-                // Quét hàng đợi tìm các Task đang giao cho Worker bị chết này để chuyển từ RUNNING -> READY [cite: 164, 165, 166, 170]
+                // Thu hồi tác vụ dở dang về trạng thái READY để phân phối lại
                 for (auto& task : task_queue) {
                     if (task.assigned_worker == worker.worker_id && task.status == "RUNNING") {
-                        task.status = "READY"; // Reset về trạng thái sẵn sàng để bộ lập lịch giao cho thợ khác [cite: 170, 171]
+                        task.status = "READY"; 
                         task.assigned_worker = -1;
-                        std::cout << "[RECOVERY] Thu hoi Task " << task.task_id << " tu Worker " 
-                                  << worker.worker_id << " ve hang doi READY.\n";
+                        std::cout << "[RECOVERY] Thu hoi Task " << task.task_id << " ve hang doi READY.\n";
                     }
                 }
                 worker.current_load = 0;
@@ -51,41 +97,34 @@ void heartbeat_monitor() {
 }
 
 // ============================================================================
-// THREAD 2: LUỒNG LẬP LỊCH PHÂN PHỐI TÁC VỤ (SCHEDULER - THUẬT TOÁN FIFO)
+// THREAD 2: LUỒNG LẬP LỊCH PHÂN PHỐI TÁC VỤ (SCHEDULER THREAD)
 // ============================================================================
-// Hàm phụ trợ tìm kiếm một Worker còn sống và đang rảnh việc (FIFO/Nhàn rỗi) [cite: 79, 80, 178]
-int select_worker_fifo() {
-    for (auto& worker : worker_table) {
-        if (worker.alive && worker.current_load == 0) { 
-            return worker.worker_id; // Chọn Worker này [cite: 19]
-        }
-    }
-    return -1; // Không có Worker nào trống lịch
-}
-
 void task_scheduler() {
     while (true) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(500)); // Quét hàng đợi mỗi 0.5 giây [cite: 196]
+        std::this_thread::sleep_for(std::chrono::milliseconds(100)); 
         
         std::lock_guard<std::mutex> t_lock(task_mutex);
         std::lock_guard<std::mutex> w_lock(worker_mutex);
         
         for (auto& task : task_queue) {
-            // Nếu phát hiện có Tác vụ đang ở trạng thái READY [cite: 185]
             if (task.status == "READY") {
-                int target_worker_id = select_worker_fifo(); // Lập lịch chọn Worker [cite: 41, 78]
+                int target_worker_id = select_worker(); 
                 
                 if (target_worker_id != -1) {
-                    // Cập nhật trạng thái tác vụ trong nội bộ Master [cite: 42, 187]
+                    // Kích hoạt đồng hồ bấm giờ khi tác vụ ĐẦU TIÊN được phân phối
+                    if (!is_experiment_started) {
+                        start_time = std::chrono::steady_clock::now();
+                        is_experiment_started = true;
+                        std::cout << "\n[TIMER] Bat dau tinh thoi gian xu ly cho toan bo hang doi...\n";
+                    }
+
                     task.status = "RUNNING";
                     task.assigned_worker = target_worker_id;
                     
-                    // Tìm socket kết nối tương ứng của Worker được chọn để gửi thông điệp [cite: 20]
                     for (auto& worker : worker_table) {
                         if (worker.worker_id == target_worker_id) {
-                            worker.current_load++; // Tăng tải của Worker [cite: 178]
+                            worker.current_load++; 
                             
-                            // Đóng gói thông điệp giao việc gửi qua TCP Socket [cite: 100, 109]
                             Message msg;
                             msg.type = TASK_ASSIGN;
                             msg.task_id = task.task_id;
@@ -94,8 +133,7 @@ void task_scheduler() {
                             
                             send(worker.socket_fd, &msg, sizeof(Message), 0);
                             std::cout << "[SCHEDULER] Giao Task " << task.task_id 
-                                      << " (" << task.task_type << ", Input: " << task.input_data 
-                                      << ") cho Worker " << target_worker_id << "\n";
+                                      << " (" << task.task_type << ") cho Worker " << target_worker_id << "\n";
                             break;
                         }
                     }
@@ -106,7 +144,7 @@ void task_scheduler() {
 }
 
 // ============================================================================
-// LUỒNG PHỤ TRỢ: GIAO TIẾP RIÊNG BIỆT VỚI TỪNG WORKER QUA SOCKET
+// LUỒNG XỬ LÝ TRUYỀN THÔNG VỚI TỪNG WORKER SOCKET
 // ============================================================================
 void handle_worker_connection(int client_fd) {
     int assigned_id = -1;
@@ -115,7 +153,7 @@ void handle_worker_connection(int client_fd) {
     while (true) {
         int valread = recv(client_fd, &msg, sizeof(Message), 0);
         
-        // Nếu Worker ngắt kết nối socket đột ngột hoặc có lỗi mạng
+        // Phát hiện Worker ngắt kết nối đột ngột (Ctrl+C)
         if (valread <= 0) {
             if (assigned_id != -1) {
                 std::lock_guard<std::mutex> w_lock(worker_mutex);
@@ -123,9 +161,8 @@ void handle_worker_connection(int client_fd) {
                 for (auto& worker : worker_table) {
                     if (worker.worker_id == assigned_id) {
                         worker.alive = false;
-                        std::cout << "\n[DISCONNECT] Socket cua Worker " << assigned_id << " da bi đóng đột ngột!\n";
+                        std::cout << "\n[DISCONNECT] Socket cua Worker " << assigned_id << " da bi dong dot ngot!\n";
                         
-                        // Thu hồi khẩn cấp các task của worker này nếu có
                         for (auto& task : task_queue) {
                             if (task.assigned_worker == assigned_id && task.status == "RUNNING") {
                                 task.status = "READY";
@@ -140,7 +177,7 @@ void handle_worker_connection(int client_fd) {
             break;
         }
 
-        // Xử lý thông điệp ĐĂNG KÝ (REGISTER) [cite: 56, 104]
+        // Xử lý gói ĐĂNG KÝ
         if (msg.type == REGISTER) {
             std::lock_guard<std::mutex> lock(worker_mutex);
             assigned_id = msg.worker_id;
@@ -150,7 +187,7 @@ void handle_worker_connection(int client_fd) {
                 if (worker.worker_id == assigned_id) {
                     worker.alive = true;
                     worker.last_heartbeat = time(nullptr);
-                    worker.socket_fd = client_fd; // Cập nhật lại socket mới nếu kết nối lại
+                    worker.socket_fd = client_fd; 
                     exists = true;
                     break;
                 }
@@ -165,102 +202,111 @@ void handle_worker_connection(int client_fd) {
                 new_worker.socket_fd = client_fd;
                 worker_table.push_back(new_worker);
             }
-            std::cout << "[MASTER] Da dang ky thanh cong Worker ID: " << assigned_id << " (Status: Alive)\n"; // [cite: 61]
+            std::cout << "[MASTER] Da dang ky thanh cong Worker ID: " << assigned_id << " (Status: Alive)\n";
         } 
-        // Xử lý thông điệp NHẬN HEARTBEAT [cite: 51, 123, 151]
+        // Xử lý gói HEARTBEAT
         else if (msg.type == HEARTBEAT) {
             std::lock_guard<std::mutex> lock(worker_mutex);
             for (auto& worker : worker_table) {
                 if (worker.worker_id == msg.worker_id && worker.alive) {
-                    worker.last_heartbeat = time(nullptr); // Cập nhật thời gian nhận heartbeat cuối [cite: 156]
-                    std::cout << "[HEARTBEAT] Nhan tu Worker ID: " << msg.worker_id << std::endl;
+                    worker.last_heartbeat = time(nullptr);
                 }
             }
         }
-        // Xử lý thông điệp NHẬN KẾT QUẢ TÁC VỤ (TASK_RESULT) [cite: 50, 117]
+        // Xử lý gói KẾT QUẢ (TASK_RESULT)
         else if (msg.type == TASK_RESULT) {
             std::lock_guard<std::mutex> t_lock(task_mutex);
             std::lock_guard<std::mutex> w_lock(worker_mutex);
             
-            // Cập nhật trạng thái Task thành COMPLETED [cite: 188]
+            int completed_count = 0;
             for (auto& task : task_queue) {
                 if (task.task_id == msg.task_id) {
                     task.status = "COMPLETED";
-                    std::cout << "\n[RESULT] Task " << task.task_id << " hoan thanh! Ket qua tu Worker " 
-                              << msg.worker_id << " la: " << msg.output << "\n";
-                    break;
+                    std::cout << "[RESULT] Task " << task.task_id << " hoan thanh tren Worker " << msg.worker_id << "\n";
+                }
+                if (task.status == "COMPLETED") {
+                    completed_count++;
                 }
             }
             
-            // Giải phóng tải (current_load) cho Worker sau khi làm xong việc [cite: 178]
             for (auto& worker : worker_table) {
                 if (worker.worker_id == msg.worker_id) {
                     if (worker.current_load > 0) worker.current_load--;
                     break;
                 }
             }
+
+            // KIỂM TRA ĐIỀU KIỆN KẾT THÚC THÍ NGHIỆM ĐỂ XUẤT SỐ LIỆU
+            if (completed_count == total_tasks_inserted && is_experiment_started) {
+                auto end_time = std::chrono::steady_clock::now();
+                auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time).count();
+                double duration_seconds = duration / 1000.0;
+                
+                std::cout << "\n========================================================\n";
+                std::cout << "[KET QUA KIEM THU / EXPERIMENT RESULT]\n";
+                std::cout << "• Thuat toan lap lich dang dung: ";
+                if(scheduling_policy == 0) std::cout << "FIFO\n";
+                else if(scheduling_policy == 1) std::cout << "Round Robin\n";
+                else std::cout << "Least Loaded\n";
+                std::cout << "• Tong so tac vu: " << total_tasks_inserted << " tasks.\n";
+                std::cout << "• Thoi gian hoan thanh (Completion Time): " << duration_seconds << " giay.\n";
+                std::cout << "• Nang suat (Throughput): " << (total_tasks_inserted / duration_seconds) << " tasks/giay.\n";
+                std::cout << "========================================================\n\n";
+                
+                is_experiment_started = false; 
+            }
         }
     }
 }
 
 // ============================================================================
-// THREAD 1: LUỒNG CHÍNH - KHỞI TẠO SERVER & CHẤP NHẬN KẾT NỐI (ACCEPT CONNECTIONS)
+// THREAD 1: CHÍNH (SERVER SETUP & ACCEPT KẾT NỐI)
 // ============================================================================
 int main() {
     int server_fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (server_fd < 0) {
-        std::cerr << "Khong the tao Socket Server!\n";
-        return -1;
-    }
-
-    // Cấu hình tái sử dụng cổng cổng tránh lỗi "Address already in use"
     int opt = 1;
     setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     sockaddr_in address;
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = INADDR_ANY;
-    address.sin_port = htons(8080); // Lắng nghe tại cổng 8080
+    address.sin_port = htons(8080);
 
-    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0) {
-        std::cerr << "Bind cong 8080 that bai!\n";
+    if (bind(server_fd, (struct sockaddr*)&address, sizeof(address)) < 0 || listen(server_fd, 10) < 0) {
+        std::cerr << "Khoi tao Server that bai!\n";
         return -1;
     }
 
-    if (listen(server_fd, 10) < 0) {
-        std::cerr << "Listen that bai!\n";
-        return -1;
+    std::cout << "[MASTER] Dang lang nghe tai cong 8080...\n";
+
+    // CHỌN THUẬT TOÁN TẠI ĐÂY TRƯỚC KHI BUILD: 0 = FIFO, 1 = Round Robin, 2 = Least Loaded
+    scheduling_policy = 0; 
+
+    // TỰ ĐỘNG SINH 100 TASKS PHỤC VỤ THÍ NGHIỆM ĐỀ BÀI YÊU CẦU
+    int test_tasks = 100; 
+    for (int i = 1; i <= test_tasks; i++) {
+        if (i % 2 == 0) {
+            task_queue.push_back({i, "factorial", 12, "READY", -1}); // Tính 12!
+        } else {
+            task_queue.push_back({i, "prime", 30000, "READY", -1});   // Đếm SNT đến 30000
+        }
     }
+    total_tasks_inserted = task_queue.size();
+    std::cout << "[MASTER] Da nap san " << total_tasks_inserted << " tac vu vao hang doi.\n";
 
-    std::cout << "[MASTER] He thong khoi dong. Dang lang nghe ket noi tai cong 8080...\n"; // [cite: 194]
-
-    // Nạp sẵn danh sách một vài bài toán tính toán mẫu vào hàng đợi (Task Submission) [cite: 65, 66]
-    // Ví dụ: tính giai thừa hoặc đếm số nguyên tố với dữ liệu đầu vào [cite: 71, 72, 73, 130, 131]
-    task_queue.push_back({10, "factorial", 12, "READY", -1});
-    task_queue.push_back({11, "prime", 100000, "READY", -1});
-    task_queue.push_back({12, "factorial", 15, "READY", -1});
-    task_queue.push_back({13, "prime", 50000, "READY", -1});
-    std::cout << "[MASTER] Da nap san 4 Tác vu mau vao hang doi.\n";
-
-    // Kích hoạt Luồng 2: Bộ lập lịch tác vụ (Scheduler Thread) [cite: 195, 196]
     std::thread scheduler_thread(task_scheduler);
     scheduler_thread.detach();
 
-    // Kích hoạt Luồng 3: Giám sát Heartbeat và lỗi kết nối (Monitor Thread) [cite: 197, 198]
     std::thread monitor_thread(heartbeat_monitor);
     monitor_thread.detach();
 
-    // Vòng lặp liên tục chờ chấp nhận các Worker mới kết nối vào hệ thống [cite: 194]
     while (true) {
         int addrlen = sizeof(address);
         int client_fd = accept(server_fd, (struct sockaddr*)&address, (socklen_t*)&addrlen);
-        if (client_fd < 0) {
-            continue;
+        if (client_fd >= 0) {
+            std::thread conn_thread(handle_worker_connection, client_fd);
+            conn_thread.detach();
         }
-        
-        // Khi một Worker kết nối thành công, tách riêng một luồng con phụ trợ để xử lý truyền thông
-        std::thread conn_thread(handle_worker_connection, client_fd);
-        conn_thread.detach();
     }
 
     close(server_fd);
